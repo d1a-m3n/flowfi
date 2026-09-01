@@ -6,6 +6,7 @@ import { sseService } from "../services/sse.service.js";
 import logger, { requestContext } from "../logger.js";
 import { Prisma } from "../generated/prisma/index.js";
 import "../lib/stream-id.js";
+import { rpcPool } from "../lib/rpc-pool.js";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -89,8 +90,8 @@ export interface IndexerEventCounters {
 // ─── Worker Class ─────────────────────────────────────────────────────────────
 
 export class SorobanEventWorker {
-  private readonly server: rpc.Server;
   private readonly contractId: string;
+  private readonly server: rpc.Server;
   private readonly pollIntervalMs: number;
   private readonly startLedger: number;
 
@@ -114,15 +115,14 @@ export class SorobanEventWorker {
   private recentOutcomes: { ok: boolean; at: number }[] = [];
 
   constructor() {
-    const rpcUrl =
-      process.env.SOROBAN_RPC_URL ?? "https://soroban-testnet.stellar.org";
     this.contractId = process.env.STREAM_CONTRACT_ID ?? "";
+    const rpcUrl = process.env.SOROBAN_RPC_URL ?? "https://soroban-testnet.stellar.org";
+    this.server = new rpc.Server(rpcUrl, { allowHttp: true });
     this.pollIntervalMs = parseInt(
       process.env.INDEXER_POLL_INTERVAL_MS ?? "5000",
       10,
     );
     this.startLedger = parseInt(process.env.INDEXER_START_LEDGER ?? "0", 10);
-    this.server = new rpc.Server(rpcUrl, { allowHttp: true });
   }
 
   /**
@@ -336,7 +336,7 @@ export class SorobanEventWorker {
       ? { ...baseFilter, cursor: state.lastCursor }
       : { ...baseFilter, startLedger: state.lastLedger || this.startLedger };
 
-    const response = await this.server.getEvents(params);
+    const response = await (this.server ? this.server.getEvents(params) : rpcPool.execute("getEvents", (server) => server.getEvents(params)));
 
     if (response.events.length === 0) return;
 
@@ -1013,39 +1013,41 @@ export class SorobanEventWorker {
     const token = decodeAddress(body["token"]);
     const timestamp = Math.floor(Date.now() / 1000);
 
-    const existingEvent = await prisma.streamEvent.findUnique({
-      where: {
-        transactionHash_eventType: {
-          transactionHash: event.txHash,
-          eventType: "FEE_COLLECTED",
-        },
-      },
-      select: { id: true },
-    });
-    if (existingEvent) {
-      logger.warn(
-        `[SorobanWorker] Duplicate StreamEvent skipped: txHash=${event.txHash} type=FEE_COLLECTED`,
-      );
-    } else {
-      await prisma.streamEvent.upsert({
+    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      const existingEvent = await tx.streamEvent.findUnique({
         where: {
           transactionHash_eventType: {
             transactionHash: event.txHash,
             eventType: "FEE_COLLECTED",
           },
         },
-        create: {
-          streamId,
-          eventType: "FEE_COLLECTED",
-          amount: feeAmount,
-          transactionHash: event.txHash,
-          ledgerSequence: event.ledger,
-          timestamp,
-          metadata: JSON.stringify({ treasury, token }),
-        },
-        update: {},
+        select: { id: true },
       });
-    }
+      if (existingEvent) {
+        logger.warn(
+          `[SorobanWorker] Duplicate StreamEvent skipped: txHash=${event.txHash} type=FEE_COLLECTED`,
+        );
+      } else {
+        await tx.streamEvent.upsert({
+          where: {
+            transactionHash_eventType: {
+              transactionHash: event.txHash,
+              eventType: "FEE_COLLECTED",
+            },
+          },
+          create: {
+            streamId,
+            eventType: "FEE_COLLECTED",
+            amount: feeAmount,
+            transactionHash: event.txHash,
+            ledgerSequence: event.ledger,
+            timestamp,
+            metadata: JSON.stringify({ treasury, token }),
+          },
+          update: {},
+        });
+      }
+    });
 
     // Broadcast to admin channel for treasury reporting
     sseService.broadcastToAdmin("stream.fee_collected", {

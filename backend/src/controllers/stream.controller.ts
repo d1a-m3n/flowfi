@@ -9,8 +9,6 @@ import {
   getClaimableFromChain,
   isStale,
   topUpStream,
-  pauseStream as sorobanPauseStream,
-  resumeStream as sorobanResumeStream,
 } from "../services/sorobanService.js";
 import type { AuthenticatedRequest } from "../types/auth.types.js";
 import { parseStreamId } from "../lib/stream-id.js";
@@ -21,6 +19,15 @@ import {
 
 const DEFAULT_STREAM_PAGE_SIZE = 20;
 const MAX_STREAM_PAGE_SIZE = 100;
+
+/**
+ * Hard cap on the number of streams fetched per user in the summary endpoint.
+ * Prevents unbounded DB queries when a wallet has thousands of streams.
+ * Users who exceed this cap receive a truncated summary (counts and totals
+ * reflect only the most recent streams) plus a `truncated` flag so the
+ * frontend can offer a pagination or export fallback.
+ */
+export const MAX_USER_STREAMS = 500;
 
 interface UserStreamSummary {
   address: string;
@@ -590,9 +597,15 @@ export const getUserStreamSummary = async (
 
     pruneUserSummaryCache(nowMs);
 
+    // Issue #1246: cap the number of streams fetched per direction to prevent
+    // unbounded DB queries.  Power users with more than MAX_USER_STREAMS
+    // streams receive a truncated summary (the `truncated` flag lets the
+    // frontend offer a pagination/export fallback).
     const [outgoingStreams, incomingStreams] = await Promise.all([
       prisma.stream.findMany({
         where: { sender: address },
+        orderBy: { startTime: "desc" },
+        take: MAX_USER_STREAMS,
         select: {
           streamId: true,
           ratePerSecond: true,
@@ -609,6 +622,8 @@ export const getUserStreamSummary = async (
       }),
       prisma.stream.findMany({
         where: { recipient: address },
+        orderBy: { startTime: "desc" },
+        take: MAX_USER_STREAMS,
         select: {
           streamId: true,
           ratePerSecond: true,
@@ -651,7 +666,11 @@ export const getUserStreamSummary = async (
       (stream: any) => stream.isActive,
     ).length;
 
-    const summary: UserStreamSummary = {
+    const truncated =
+      outgoingStreams.length >= MAX_USER_STREAMS ||
+      incomingStreams.length >= MAX_USER_STREAMS;
+
+    const summary = {
       address,
       totalStreamsCreated,
       totalStreamedOut,
@@ -659,7 +678,8 @@ export const getUserStreamSummary = async (
       currentClaimable: claimableInTotal.toString(),
       activeOutgoingCount,
       activeIncomingCount,
-    };
+      ...(truncated ? { truncated: true } : {}),
+    } satisfies UserStreamSummary & { truncated?: boolean };
 
     userSummaryCache.set(cacheKey, {
       value: summary,
@@ -730,19 +750,24 @@ export const topUpStreamHandler = async (req: Request, res: Response) => {
 
     const txHash = await topUpStream(streamId, amount, callerAddress);
 
-    const newDeposited = (BigInt(stream.depositedAmount) + amount).toString();
-    await prisma.stream.update({
-      where: { streamId },
-      data: {
-        depositedAmount: newDeposited,
-        lastUpdateTime: BigInt(Math.floor(Date.now() / 1000)),
-      },
-    });
+    // Use raw SQL atomic increment to prevent concurrent top-ups from
+    // overwriting each other's updates (Issue #1217 — read-compute-write race).
+    // Prisma's built-in { increment } is unavailable on String-typed columns,
+    // so we perform SET deposited_amount = deposited_amount + $1::bigint
+    // directly in a single SQL statement.
+    const now = BigInt(Math.floor(Date.now() / 1000));
+    await prisma.$executeRawUnsafe(
+      `UPDATE "Stream" SET "depositedAmount" = ("depositedAmount"::bigint + $1::bigint)::text, "lastUpdateTime" = $2 WHERE "streamId" = $3`,
+      amount.toString(),
+      now,
+      streamId,
+    );
+    const updatedStream = await prisma.stream.findUnique({ where: { streamId } });
 
     logger.info(`[topUp] stream=${streamId} amount=${amount} txHash=${txHash}`);
     return res
       .status(200)
-      .json({ streamId, txHash, depositedAmount: newDeposited });
+      .json({ streamId, txHash, depositedAmount: updatedStream!.depositedAmount });
   } catch (error: any) {
     logger.error(`[topUp] stream=${streamId} error:`, error);
     return res.status(400).json({ error: 'Failed to top up stream on chain', message: error.message ?? 'Unknown error' });
@@ -804,36 +829,11 @@ export const pauseStream = async (req: Request, res: Response) => {
       });
     }
 
-    try {
-      // Call Soroban service to verify the pause operation would succeed
-      const result = await sorobanPauseStream(
-        authReq.user.publicKey,
-        parsedStreamId,
-      );
-
-      logger.info(
-        `Stream ${parsedStreamId} pause simulated by ${authReq.user.publicKey}`,
-      );
-
-      return res.status(200).json({
-        success: true,
-        streamId: parsedStreamId,
-        txHash: result.txHash,
-        stream,
-      });
-    } catch (sorobanError) {
-      logger.error(
-        `Soroban pause failed for stream ${parsedStreamId}:`,
-        sorobanError,
-      );
-      return res.status(400).json({
-        error: "Failed to pause stream on chain",
-        message:
-          sorobanError instanceof Error
-            ? sorobanError.message
-            : "Unknown error",
-      });
-    }
+    return res.status(501).json({
+      error: "Not Implemented",
+      message:
+        "Pausing streams is not currently supported because the on-chain transaction is not yet submitted.",
+    });
   } catch (error) {
     logger.error("Error pausing stream:", error);
     return res.status(500).json({ error: "Internal server error" });
@@ -887,36 +887,11 @@ export const resumeStream = async (req: Request, res: Response) => {
       });
     }
 
-    try {
-      // Call Soroban service to verify the resume operation would succeed
-      const result = await sorobanResumeStream(
-        authReq.user.publicKey,
-        parsedStreamId,
-      );
-
-      logger.info(
-        `Stream ${parsedStreamId} resume simulated by ${authReq.user.publicKey}`,
-      );
-
-      return res.status(200).json({
-        success: true,
-        streamId: parsedStreamId,
-        txHash: result.txHash,
-        stream,
-      });
-    } catch (sorobanError) {
-      logger.error(
-        `Soroban resume failed for stream ${parsedStreamId}:`,
-        sorobanError,
-      );
-      return res.status(400).json({
-        error: "Failed to resume stream on chain",
-        message:
-          sorobanError instanceof Error
-            ? sorobanError.message
-            : "Unknown error",
-      });
-    }
+    return res.status(501).json({
+      error: "Not Implemented",
+      message:
+        "Resuming streams is not currently supported because the on-chain transaction is not yet submitted.",
+    });
   } catch (error) {
     logger.error("Error resuming stream:", error);
     return res.status(500).json({ error: "Internal server error" });
